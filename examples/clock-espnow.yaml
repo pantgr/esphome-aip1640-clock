@@ -1,0 +1,235 @@
+# AiP1640 LED clock on an ESP32-S3 — room humidity/temperature arrive over ESP-NOW from another ESP.
+# Face (11 RAM bytes of a commercial «HH:MM 45%RH DD.MM» clock board, see README «Display map»):
+#   time 00H 01H : 02H 03H (blinking colon), humidity 04H 05H + «%RH» (06H), date DD.MM in 07H-0AH
+#   alternating every 5 s with the temperature «24.5°C».
+# In daily use since 2026-10. Adjust the substitutions; if your board differs, find its map with the
+# «poke» number on the web page (README «Map your own board»).
+
+substitutions:
+  name: esp-clock
+  friendly_name: ESP Clock
+  timezone: Europe/Athens
+  ntp_primary: 192.168.1.10      # e.g. a GPS NTP server on the LAN (see gps-ntp/)
+  ntp_fallback: 192.168.1.1      # e.g. the router
+  sensor_mac: "AA:BB:CC:DD:EE:FF" # the ESP that sends humidity/temperature over ESP-NOW
+  lux_entity: sensor.outdoor_lux  # any Home Assistant lux sensor, for auto brightness
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+
+external_components:
+  - source: github://pantgr/esphome-aip1640-clock
+    components: [aip1640]
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+ota:
+  - platform: esphome
+
+api:
+  encryption:
+    key: !secret api_key
+
+web_server:
+  port: 80
+
+# Restored states (board rgb, auto brightness) reach flash 5 s after a change, not the default 1 min.
+preferences:
+  flash_write_interval: 5s
+
+# Onboard WS2812 of the YD-ESP32-S3 board (GPIO48, «RGB» solder jumper closed). Optional.
+light:
+  - platform: esp32_rmt_led_strip
+    id: board_rgb
+    name: board rgb
+    restore_mode: RESTORE_DEFAULT_ON
+    # Slider at 0 = Off (ESPHome keeps an explicit turn_on at brightness 0 as ON-but-dark).
+    on_state:
+      - lambda: |-
+          auto &v = id(board_rgb).remote_values;
+          if (v.is_on() && v.get_brightness() == 0.0f) id(board_rgb).turn_off().perform();
+    pin: GPIO48
+    num_leds: 1
+    chipset: ws2812
+    channel_colors: GRB
+    effects:
+      - addressable_rainbow:
+          speed: 3
+
+aip1640:
+  id: aip
+  clk_pin: GPIO40   # -> 74HCT245 A1 -> B1 -> AiP1640 pin 8 (CLK)
+  dio_pin: GPIO21   # -> 74HCT245 A2 -> B2 -> AiP1640 pin 7 (DATA)
+  brightness: 0
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+    servers:
+      - ${ntp_primary}
+      - ${ntp_fallback}
+
+# Room humidity/temperature; older than 10 min = shown dark.
+globals:
+  - id: hum_val
+    type: int
+    initial_value: '-1'
+  - id: hum_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: temp_val
+    type: int
+    initial_value: '0'
+  - id: temp_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: temp_ok
+    type: bool
+    initial_value: 'false'
+
+# Payload from the sensor ESP every 30 s: {'H', humidity %, 'T', int16 LE temperature in 0.1 °C}.
+espnow:
+  peers:
+    - ${sensor_mac}
+  on_receive:
+    - address: ${sensor_mac}
+      then:
+        - lambda: |-
+            if (size >= 2 && data[0] == 0x48) {
+              id(hum_val) = data[1];
+              id(hum_ms) = millis();
+            }
+            if (size >= 5 && data[2] == 0x54) {
+              id(temp_val) = (int16_t) (data[3] | (data[4] << 8));   // 0.1 °C
+              id(temp_ms) = millis();
+              id(temp_ok) = true;
+            }
+
+# Auto brightness from a lux sensor: levels 0..4 = hw 0,1,2,3,7 (AiP1640 steps above 3 look the same).
+# Up at 25 / 60 / 250 / 1000 lx, down at x0.6 of each threshold (hysteresis).
+sensor:
+  - platform: homeassistant
+    id: lux
+    entity_id: ${lux_entity}
+    internal: true
+    on_value:
+      - lambda: |-
+          if (!id(auto_bright).state) return;
+          static const float T[4] = {25, 60, 250, 1000};
+          static const uint8_t HW[5] = {0, 1, 2, 3, 7};
+          static int lvl = -1;
+          int up = 0;
+          while (up < 4 && x >= T[up]) up++;
+          int down = 0;
+          while (down < 4 && x >= T[down] * 0.6f) down++;
+          int next = lvl < 0 ? up : (up > lvl ? up : (down < lvl ? down : lvl));
+          if (next != lvl) {
+            lvl = next;
+            id(aip).brightness(HW[lvl]);
+          }
+
+switch:
+  - platform: template
+    id: auto_bright
+    name: auto brightness
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# Clock face. «--:--» until the first SNTP sync; unknown humidity = those digits dark.
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          static const uint8_t F[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+          static bool colon = false;
+          colon = !colon;
+          auto &r = id(aip).ram;
+          for (auto &b : r) b = 0;
+          auto t = id(sntp_time).now();
+          if (t.is_valid()) {
+            r[0] = F[t.hour / 10];
+            r[1] = F[t.hour % 10];
+            r[2] = F[t.minute / 10];
+            r[3] = F[t.minute % 10];
+            bool temp_fresh = id(temp_ok) && millis() - id(temp_ms) < 600000;
+            if (temp_fresh && (t.second / 5) % 2 == 1) {
+              // «24.5°C»: 07H 08H digits, 09H tenths with bit7 = the lower dot, 0AH = 'C' + upper dot as °.
+              // Below zero 07H is the minus; -10.0 and colder lose the decimal: «-12°C».
+              int tv = id(temp_val);
+              int a = tv < 0 ? -tv : tv;
+              if (a > 999) a = 999;
+              if (tv >= 0) {
+                if (a >= 100) r[7] = F[a / 100];
+                r[8] = F[(a / 10) % 10];
+                r[9] = F[a % 10] | 0x80;
+              } else if (a < 100) {
+                r[7] = 0x40;
+                r[8] = F[a / 10];
+                r[9] = F[a % 10] | 0x80;
+              } else {
+                int ai = (a + 5) / 10;
+                r[7] = 0x40;
+                r[8] = F[(ai / 10) % 10];
+                r[9] = F[ai % 10];
+              }
+              r[10] = 0x39 | 0x80;
+            } else {
+              r[7] = F[t.day_of_month / 10];
+              r[8] = F[t.day_of_month % 10];
+              r[9] = F[t.month / 10] | 0x80;
+              r[10] = F[t.month % 10];
+            }
+          } else {
+            r[0] = r[1] = r[2] = r[3] = 0x40;
+          }
+          if (id(hum_val) >= 0 && millis() - id(hum_ms) < 600000) {
+            int hi = id(hum_val);
+            if (hi > 99) hi = 99;
+            if (hi >= 10) r[4] = F[hi / 10];
+            r[5] = F[hi % 10];
+            r[6] = 0xFF;
+          }
+          if (colon) { r[1] |= 0x80; r[2] |= 0x80; }
+          id(aip).write_all();
+
+number:
+  # Bring-up / mapping tool: value = address * 256 + byte (e.g. 0x0006 lights segment pattern 0x06 at 00H).
+  # The clock face overwrites it every 500 ms; comment the interval out while mapping a new board.
+  - platform: template
+    name: poke
+    min_value: 0
+    max_value: 4095
+    step: 1
+    optimistic: true
+    mode: box
+    set_action:
+      - lambda: 'id(aip).write((uint8_t) (((int) x) >> 8), (uint8_t) (((int) x) & 0xFF));'
+  # AiP1640 p12: the 8 hardware steps are 1/16 2/16 4/16 10/16 .. 14/16; above step 3 the eye sees no change.
+  - platform: template
+    name: brightness
+    min_value: 0
+    max_value: 4
+    step: 1
+    optimistic: true
+    initial_value: 0
+    mode: box
+    set_action:
+      - lambda: |-
+          static const uint8_t HW[5] = {0, 1, 2, 3, 7};
+          id(aip).brightness(HW[(int) x]);
+
+button:
+  - platform: template
+    name: clear
+    on_press:
+      - lambda: 'id(aip).clear();'
