@@ -50,6 +50,86 @@ No pull-ups were needed through the 74HCT245 (the datasheet's reference circuit 
 Note: on our boards CLK and DATA were swapped compared with the first plan — if nothing lights up, swap
 the two pins in the yaml before anything else.
 
+## Pinouts and the level shifter, step by step
+
+### 1. Find the 4 wires of your clock
+
+The original MCU board talks to the display board over 4 wires: **5 V, GND, CLK, DATA**. Before you
+unplug anything, identify them with the old MCU running:
+
+- **5 V / GND**: DC voltmeter. Write down the voltage — it decides whether you need a level shifter (step 3).
+- **CLK**: on a scope, bursts of 8 pulses per byte; idles high between frames.
+- **DATA**: changes only while CLK is low, except START (DATA falls while CLK is high) and STOP
+  (DATA rises while CLK is high).
+
+No scope? Follow the traces to the AiP1640: **pin 7 = DATA, pin 8 = CLK, pin 17 = VDD, pin 6 = GND**.
+
+### 2. AiP1640 pinout (SOP28, datasheet p6-7)
+
+| Pin | Name | Pin | Name |
+|---|---|---|---|
+| 1-5 | GRID12-GRID16 | 17 | **VDD** (3.0-5.5 V) |
+| 6 | **GND** | 18-28 | GRID1-GRID11 |
+| 7 | **DATA** (DIN) | | |
+| 8 | **CLK** | | |
+| 9-16 | SEG1-SEG8 | | |
+
+SEG pins drive the LED anodes (PMOS open-drain), GRID pins the cathodes (NMOS open-drain).
+
+**TM1640** (Titan Micro): same SOP28 pinout, same commands, RAM map, START/STOP and bit order (LSB
+first). Datasheet differences: VDD 5 V ±10 % (AiP1640: 3-5.5 V), VIL ≤ 0.3·VDD (AiP1640: ≤ 0.2·VDD),
+oscillator 450 vs 400 kHz. This component should drive both, but it has been tested on the AiP1640 only.
+
+### 3. Do you need a level shifter?
+
+The AiP1640 reads a HIGH only above **VIH = 0.7·VDD**:
+
+| Clock VDD (step 1) | VIH | ESP32 3.3 V output | Level shifter |
+|---|---|---|---|
+| 5 V | 3.5 V | too low — may work on the bench, fails at random | **needed** |
+| 3.3 V | 2.31 V | fine | not needed: ESP GPIO → AiP1640 directly |
+
+### 4. 74HCT245 pinout and wiring (DIP-20, ST M74HCT245 datasheet)
+
+```
+            ┌────┬─┬────┐
+   DIR   1 ─┤    └─┘    ├─ 20  VCC  ── clock 5 V
+   A1    2 ─┤           ├─ 19  /G   ── GND (always enabled)
+   A2    3 ─┤           ├─ 18  B1   ── AiP1640 pin 8 (CLK)
+   A3    4 ─┤           ├─ 17  B2   ── AiP1640 pin 7 (DATA)
+   A4    5 ─┤ 74HCT245  ├─ 16  B3
+   A5    6 ─┤           ├─ 15  B4
+   A6    7 ─┤           ├─ 14  B5
+   A7    8 ─┤           ├─ 13  B6
+   A8    9 ─┤           ├─ 12  B7
+   GND  10 ─┤           ├─ 11  B8
+            └───────────┘
+DIR (1)  ── clock 5 V      (DIR high + /G low = A -> B)
+A1  (2)  ── ESP32 GPIO40   (CLK)
+A2  (3)  ── ESP32 GPIO21   (DATA)
+A3..A8   ── GND            (datasheet: floating inputs must be held HIGH or LOW)
+GND (10) ── common GND of clock + shifter + ESP
+```
+
+Why an **HCT** part: its inputs are TTL-level (VIH ≥ 2.0 V), so the ESP's 3.3 V counts as HIGH, while
+its outputs swing to the 5 V rail (VOH ≥ 4.18 V at 4.5 V, -6 mA). A plain **HC** part at 5 V needs
+3.5 V in — same problem as the AiP1640. The '245 has only one supply pin (20): the ESP's 3.3 V goes
+nowhere near it. Any other 5 V-tolerant, TTL-input buffer (74HCT125, 74AHCT125 …) works the same way.
+
+### 5. ESP32-S3 pins
+
+| Used | Pin |
+|---|---|
+| CLK | GPIO40 |
+| DATA | GPIO21 |
+| Power | 5Vin (from the clock 5 V) + GND |
+| Onboard RGB (optional) | GPIO48 |
+
+Any free output GPIO works for CLK/DATA. Avoid on the ESP32-S3: **0, 3, 45, 46** (strapping),
+**19, 20** (USB D-/D+), **43, 44** (UART0 log), **26-32** (flash/PSRAM), and **33-37** on octal-PSRAM
+modules such as N16R8 (ESP-IDF GPIO docs). Note: some YD-ESP32-S3 seller pinout images label GPIO21 as
+USB D+ — that is wrong; Espressif's DevKitC-1 guide puts USB on GPIO19/20.
+
 ## Using the component
 
 ```yaml
